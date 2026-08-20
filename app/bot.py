@@ -18,7 +18,7 @@ if not BOT_TOKEN or not MONGO_URI or not ADMIN_IDS: raise RuntimeError('Set BOT_
 
 bot=Bot(BOT_TOKEN); dp=Dispatcher(); router=Router(); dp.include_router(router)
 db=AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
-users, deposits, products, orders, support, settings=(db[x] for x in ('users','deposits','products','orders','support','settings'))
+users, deposits, products, orders, support, settings, admin_states=(db[x] for x in ('users','deposits','products','orders','support','settings','admin_states'))
 
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -41,7 +41,8 @@ def admin_payment_kb():
         [InlineKeyboardButton(text='💳 UPI ID',callback_data='ps:upi'),InlineKeyboardButton(text='📷 QR Code',callback_data='ps:qr')],
         [InlineKeyboardButton(text='💬 Payment Text',callback_data='ps:text')],
         [InlineKeyboardButton(text='💰 Minimum Deposit',callback_data='ps:min'),InlineKeyboardButton(text='💰 Maximum Deposit',callback_data='ps:max')],
-        [InlineKeyboardButton(text='📋 View Settings',callback_data='ps:view')]
+        [InlineKeyboardButton(text='📋 View Settings',callback_data='ps:view')],
+        [InlineKeyboardButton(text='⬅️ Admin Panel',callback_data='admin:home')]
     ])
 
 async def show_payment_settings(target):
@@ -151,10 +152,140 @@ async def amount(m:Message):
         await m.answer(text)
 
 
+def admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💳 Payment Settings',callback_data='admin:payment')],
+        [InlineKeyboardButton(text='🛍️ Manage Products',callback_data='admin:products')],
+    ])
+
+def product_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='➕ Add Product',callback_data='prod:add')],
+        [InlineKeyboardButton(text='📋 Product List',callback_data='prod:list')],
+        [InlineKeyboardButton(text='⬅️ Admin Panel',callback_data='admin:home')],
+    ])
+
+async def show_product_admin(c):
+    docs=await products.find({}).sort([('country',1),('name',1)]).to_list(50)
+    lines=["🛍️ <b>Product Manager</b>",""]
+    if not docs:
+        lines.append("No products added yet.")
+    else:
+        for p in docs:
+            status="🟢" if p.get('active',True) else "🔴"
+            lines.append(f"{status} {p.get('country','Unknown')} • {p.get('name','Unnamed')} — ₹{float(p.get('price',0)):.2f}")
+    await c.message.edit_text("\n".join(lines),reply_markup=product_admin_kb())
+
+async def set_state(uid, data):
+    await admin_states.update_one({'_id':uid},{'$set':data},upsert=True)
+
+async def get_state(uid):
+    return await admin_states.find_one({'_id':uid})
+
+async def clear_state(uid):
+    await admin_states.delete_one({'_id':uid})
+
+async def show_product_list(c):
+    docs=await products.find({}).sort([('country',1),('name',1)]).to_list(50)
+    rows=[]
+    for p in docs:
+        rows.append([InlineKeyboardButton(
+            text=f"{'🟢' if p.get('active',True) else '🔴'} {p.get('country','?')} • {p.get('name','Unnamed')} — ₹{float(p.get('price',0)):.2f}",
+            callback_data=f"prod:view:{p['_id']}")])
+    rows.append([InlineKeyboardButton(text='➕ Add Product',callback_data='prod:add')])
+    rows.append([InlineKeyboardButton(text='⬅️ Back',callback_data='admin:products')])
+    await c.message.edit_text("📋 <b>Product List</b>\n\nTap a product to edit, disable or delete it.",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
 @router.message(F.text=='/admin')
 async def admin_panel(m:Message):
     if m.from_user.id not in ADMIN_IDS: return await m.answer('Not authorized.')
-    await m.answer('🛠️ <b>Admin Panel</b>\n\nPayment settings:',reply_markup=admin_payment_kb())
+    await m.answer('🛠️ <b>Admin Panel</b>\n\nChoose what you want to manage:',
+                    reply_markup=admin_main_kb())
+
+@router.callback_query(F.data=='admin:home')
+async def admin_home(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    await c.message.edit_text('🛠️ <b>Admin Panel</b>\n\nChoose what you want to manage:',
+                              reply_markup=admin_main_kb())
+    await c.answer()
+
+@router.callback_query(F.data=='admin:payment')
+async def admin_payment(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    await show_payment_settings(c.message)
+    await c.answer()
+
+@router.callback_query(F.data=='admin:products')
+async def admin_products(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    await show_product_admin(c)
+    await c.answer()
+
+@router.callback_query(F.data=='prod:list')
+async def prod_list(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    await show_product_list(c)
+    await c.answer()
+
+@router.callback_query(F.data=='prod:add')
+async def prod_add(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    await set_state(c.from_user.id, {'action':'add_country'})
+    await c.message.answer("🌍 <b>Add Product</b>\n\nSend the country name.")
+    await c.answer()
+
+@router.callback_query(F.data.startswith('prod:view:'))
+async def prod_view(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    pid=ObjectId(c.data.split(':',2)[2])
+    p=await products.find_one({'_id':pid})
+    if not p: return await c.answer('Product not found.',show_alert=True)
+    status='🟢 Active' if p.get('active',True) else '🔴 Disabled'
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✏️ Edit',callback_data=f'prod:edit:{pid}'),
+         InlineKeyboardButton(text='🔄 Enable/Disable',callback_data=f'prod:toggle:{pid}')],
+        [InlineKeyboardButton(text='🗑️ Delete',callback_data=f'prod:delete:{pid}')],
+        [InlineKeyboardButton(text='⬅️ Product List',callback_data='prod:list')],
+    ])
+    await c.message.edit_text(
+        f"🛍️ <b>Product</b>\n\n🌍 Country: <b>{p.get('country','Unknown')}</b>\n"
+        f"📦 Name: <b>{p.get('name','Unnamed')}</b>\n💰 Price: <b>₹{float(p.get('price',0)):.2f}</b>\n"
+        f"📌 Status: {status}", reply_markup=kb)
+    await c.answer()
+
+@router.callback_query(F.data.startswith('prod:edit:'))
+async def prod_edit(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    pid=ObjectId(c.data.split(':',2)[2])
+    p=await products.find_one({'_id':pid})
+    if not p: return await c.answer('Product not found.',show_alert=True)
+    await set_state(c.from_user.id, {'action':'edit_product','product_id':pid})
+    await c.message.answer(
+        "✏️ <b>Edit Product</b>\n\n"
+        "Send exactly 3 lines:\n"
+        "1) Country\n2) Product name\n3) Price\n\n"
+        "Example:\nIndia\nPremium Product\n95")
+    await c.answer()
+
+@router.callback_query(F.data.startswith('prod:toggle:'))
+async def prod_toggle(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    pid=ObjectId(c.data.split(':',2)[2])
+    p=await products.find_one({'_id':pid})
+    if not p: return await c.answer('Product not found.',show_alert=True)
+    new_status=not p.get('active',True)
+    await products.update_one({'_id':pid},{'$set':{'active':new_status,'updated_at':datetime.now(timezone.utc)}})
+    await c.answer('Enabled' if new_status else 'Disabled')
+    await prod_view(c)
+
+@router.callback_query(F.data.startswith('prod:delete:'))
+async def prod_delete(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
+    pid=ObjectId(c.data.split(':',2)[2])
+    result=await products.delete_one({'_id':pid})
+    await c.answer('Deleted' if result.deleted_count else 'Not found',show_alert=True)
+    await show_product_list(c)
 
 @router.callback_query(F.data=='ps:view')
 async def ps_view(c:CallbackQuery):
@@ -184,6 +315,56 @@ async def payment_or_qr_photo(m:Message):
     for aid in ADMIN_IDS:
         await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>Deposit Request</b>\nBuyer: {m.from_user.full_name}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
     await m.answer('📨 Screenshot received. Admin will verify it.')
+
+@router.message(F.text)
+async def admin_catalog_text(m:Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    st=await get_state(m.from_user.id)
+    if not st:
+        return
+    action=st.get('action')
+    value=m.text.strip()
+    if value.lower()=='/cancel':
+        await clear_state(m.from_user.id)
+        return await m.answer('❌ Operation cancelled.')
+    if action=='add_country':
+        await set_state(m.from_user.id, {'action':'add_name','country':value})
+        return await m.answer('📦 Now send the product/item name.')
+    if action=='add_name':
+        await set_state(m.from_user.id, {'action':'add_price','country':st['country'],'name':value})
+        return await m.answer('💰 Now send the price, e.g. <code>95</code>.')
+    if action=='add_price':
+        try:
+            price=float(value)
+        except ValueError:
+            return await m.answer('Please send a valid number, e.g. <code>95</code>.')
+        if price<0:
+            return await m.answer('Price cannot be negative.')
+        await products.insert_one({
+            'country':st['country'],'name':st['name'],'price':price,'active':True,
+            'created_at':datetime.now(timezone.utc),'created_by':m.from_user.id
+        })
+        await clear_state(m.from_user.id)
+        return await m.answer(
+            f"✅ <b>Product added</b>\n\n🌍 {st['country']}\n📦 {st['name']}\n💰 ₹{price:.2f}",
+            reply_markup=product_admin_kb())
+    if action=='edit_product':
+        parts=[x.strip() for x in value.splitlines() if x.strip()]
+        if len(parts)!=3:
+            return await m.answer('Send exactly 3 lines: Country\nProduct name\nPrice')
+        try:
+            price=float(parts[2])
+        except ValueError:
+            return await m.answer('Price must be a number, e.g. 95.')
+        if price<0:
+            return await m.answer('Price cannot be negative.')
+        await products.update_one({'_id':st['product_id']},{
+            '$set':{'country':parts[0],'name':parts[1],'price':price,'updated_at':datetime.now(timezone.utc),'updated_by':m.from_user.id}})
+        await clear_state(m.from_user.id)
+        return await m.answer(
+            f"✅ <b>Product updated</b>\n\n🌍 {parts[0]}\n📦 {parts[1]}\n💰 ₹{price:.2f}",
+            reply_markup=product_admin_kb())
 
 @router.message(F.text)
 async def admin_payment_text(m:Message):
@@ -241,7 +422,7 @@ async def dep_no(c:CallbackQuery):
 @router.callback_query(F.data=='products')
 async def show_products(c:CallbackQuery):
     ps=await products.find({'active':True}).to_list(30)
-    rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
+    rows=[[InlineKeyboardButton(text=f"🌍 {p.get('country','')} • {p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
     await c.message.edit_text('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
 
@@ -252,7 +433,7 @@ async def buy(c:CallbackQuery):
     u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
     if bal<p['price']: return await c.answer('Insufficient wallet balance.',show_alert=True)
     await users.update_one({'_id':c.from_user.id},{'$inc':{'balance':-p['price']}})
-    o={'user_id':c.from_user.id,'product_id':p['_id'],'product_name':p['name'],'amount':p['price'],'status':'pending_admin','created_at':datetime.now(timezone.utc)}
+    o={'user_id':c.from_user.id,'product_id':p['_id'],'product_name':p['name'],'country':p.get('country',''),'amount':p['price'],'status':'pending_admin','created_at':datetime.now(timezone.utc)}
     r=await orders.insert_one(o)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{r.inserted_id}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{r.inserted_id}")]])
     for aid in ADMIN_IDS:
