@@ -1,18 +1,11 @@
 # WasteBotz
 
-Safe Telegram digital-store bot with force-join, wallet/deposit approval, admin fund management and a normal digital-product catalogue.
+## Run
 
-## Railway
-Start command: `python -m app.bot`
+python -m app.bot
 
-Required variables: BOT_TOKEN, MONGO_URI, MONGO_DB, ADMIN_IDS
+Set BOT_TOKEN, MONGO_URI and ADMIN_IDS in Railway Variables.
 
-## Admin commands
-- /admin
-- /balance <telegram_id or @username>
-- /addfunds <telegram_id or @username> <amount>
-- /removefunds <telegram_id or @username> <amount>
-
-Deposit requests expire after 30 minutes. Payment screenshots are sent to all configured ADMIN_IDS with Approve/Reject buttons.
-
-This build does not automate Telegram account login, OTP delivery, session handling, or account transfers.
+## Payment flow
+Amount -> Transaction ID -> Screenshot -> Admin Approve/Decline.
+Numeric transaction IDs are handled correctly and are not treated as deposit amounts.
