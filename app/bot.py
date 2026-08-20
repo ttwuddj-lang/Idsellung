@@ -2,7 +2,7 @@ import asyncio, logging, os
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -106,16 +106,19 @@ async def verify_join(c:CallbackQuery):
 
 @router.callback_query(F.data=='home')
 async def home(c:CallbackQuery):
-    await c.message.edit_text('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb()); await c.answer()
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
+    await c.message.answer('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb()); await c.answer()
 
 @router.callback_query(F.data=='wallet')
 async def wallet(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Deposit',callback_data='deposit')],[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])
-    await c.message.edit_text(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb); await c.answer()
+    await c.message.answer(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb); await c.answer()
 
 @router.callback_query(F.data=='deposit')
 async def deposit(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     p=await get_payment_settings()
     text=(f"💳 <b>Deposit</b>\n\nSend any amount between ₹{float(p.get('min_deposit',1)):.2f}"
           f" and {('₹'+format(float(p['max_deposit']),'.2f')) if float(p.get('max_deposit',0))>0 else 'No maximum limit'}.\n\n"
@@ -254,13 +257,15 @@ async def dep_no(c:CallbackQuery):
 
 @router.callback_query(F.data=='products')
 async def show_products(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     ps=await products.find({'active':True}).to_list(30)
     rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
-    await c.message.edit_text('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
+    await c.message.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
 
 @router.callback_query(F.data.startswith('buy:'))
 async def buy(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     p=await products.find_one({'_id':ObjectId(c.data.split(':')[1]),'active':True})
     if not p: return await c.answer('Unavailable.',show_alert=True)
     u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
@@ -295,12 +300,66 @@ async def ord_ref(c:CallbackQuery):
 
 @router.callback_query(F.data=='orders')
 async def orders_list(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     docs=await orders.find({'user_id':c.from_user.id}).sort('created_at',-1).to_list(10)
     text='📦 <b>My Orders</b>\n\n'+('\n'.join(f"• {o['product_name']} — ₹{o['amount']:.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
-    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
+    await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
+
+async def require_join_message(m:Message):
+    if not await is_joined(m.from_user.id):
+        await send_join_gate(m)
+        return False
+    return True
+
+@router.message(Command("buy"))
+async def cmd_buy(m:Message):
+    if not await require_join_message(m): return
+    ps=await products.find({'active':True}).to_list(30)
+    rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
+    rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
+    await m.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@router.message(Command("wallet"))
+async def cmd_wallet(m:Message):
+    if not await require_join_message(m): return
+    u=await users.find_one({'_id':m.from_user.id}); bal=float((u or {}).get('balance',0))
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Deposit',callback_data='deposit')],[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])
+    await m.answer(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb)
+
+@router.message(Command("orders"))
+async def cmd_orders(m:Message):
+    if not await require_join_message(m): return
+    docs=await orders.find({'user_id':m.from_user.id}).sort('created_at',-1).to_list(10)
+    text='📦 <b>My Orders</b>\n\n'+('\\n'.join(f"• {o['product_name']} — ₹{o['amount']:.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
+    await m.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]]))
+
+@router.message(Command("support"))
+async def cmd_support(m:Message):
+    if not await require_join_message(m): return
+    now=datetime.now(timezone.utc)
+    await support.insert_one({'user_id':m.from_user.id,'status':'open','expires_at':now+timedelta(minutes=5),'created_at':now})
+    await m.answer('💬 <b>Support session started.</b>\nYou have 5 minutes to send your payment/order questions.')
+
+@router.message(Command("broadcast"))
+async def broadcast(m:Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return await m.answer('Not authorized.')
+    src=m.reply_to_message
+    if not src:
+        return await m.answer('📢 Reply to the message you want to broadcast, then send /broadcast.')
+    sent=0; failed=0
+    async for u in users.find({}, {'_id':1}):
+        uid=u['_id']
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=src.chat.id, message_id=src.message_id)
+            sent+=1
+        except Exception:
+            failed+=1
+    await m.answer(f'📢 <b>Broadcast completed</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}')
 
 @router.callback_query(F.data=='support')
 async def support_start(c:CallbackQuery):
+    if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
     now=datetime.now(timezone.utc)
     await support.insert_one({'user_id':c.from_user.id,'status':'open','expires_at':now+timedelta(minutes=5),'created_at':now})
     await c.message.answer('💬 <b>Support session started.</b>\nYou have 5 minutes to send your payment/order questions.'); await c.answer()
@@ -313,6 +372,8 @@ async def cleanup():
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([BotCommand(command='start',description='Start / verify'),BotCommand(command='buy',description='Buy products'),BotCommand(command='wallet',description='Wallet / Deposit'),BotCommand(command='orders',description='My orders'),BotCommand(command='support',description='Support (5 min)'),BotCommand(command='admin',description='Admin panel'),BotCommand(command='broadcast',description='Broadcast a replied message')])
     await asyncio.gather(dp.start_polling(bot),cleanup())
 
 if __name__=='__main__': asyncio.run(main())
