@@ -1,20 +1,18 @@
-# Waste Botz
+# WasteBotz
 
-Admin catalogue: country, product name, price; add/edit/delete/enable/disable.
-Payment settings: UPI, QR, instructions, min/max deposit.
-MongoDB-backed wallet, deposits, orders and support.
-Force join @jp_network.
+Safe Telegram digital-store bot with force-join, wallet/deposit approval, admin fund management and a normal digital-product catalogue.
 
-This build does not automate Telegram account login, OTPs, session strings, 2FA passwords, or account transfers.
+## Railway
+Start command: `python -m app.bot`
 
+Required variables: BOT_TOKEN, MONGO_URI, MONGO_DB, ADMIN_IDS
 
-## Admin user funds
+## Admin commands
+- /admin
+- /balance <telegram_id or @username>
+- /addfunds <telegram_id or @username> <amount>
+- /removefunds <telegram_id or @username> <amount>
 
-Admins can manage user wallet funds from `/admin` → **Manage User Funds**.
+Deposit requests expire after 30 minutes. Payment screenshots are sent to all configured ADMIN_IDS with Approve/Reject buttons.
 
-Commands:
-- `/balance USER_ID_OR_USERNAME`
-- `/addfunds USER_ID_OR_USERNAME AMOUNT`
-- `/removefunds USER_ID_OR_USERNAME AMOUNT`
-
-Fund changes are recorded in MongoDB `wallet_transactions`. Removing more than the user's balance is blocked. Deposit requests remain valid for 30 minutes.
+This build does not automate Telegram account login, OTP delivery, session handling, or account transfers.
