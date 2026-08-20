@@ -130,16 +130,20 @@ async def deposit(c:CallbackQuery):
         await c.message.answer(text)
     await c.answer()
 
-@router.message(F.text.regexp(r'^\d+(\.\d{1,2})?$'))
-async def amount_or_transaction(m:Message):
+@router.message(F.text)
+async def text_flow(m:Message):
+    value=m.text.strip()
+    # Active deposit transaction IDs may be numeric OR alphanumeric.
     dep = await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_transaction'},sort=[('created_at',-1)])
     if dep:
         expires=dep.get('expires_at')
         if expires and expires <= datetime.now(timezone.utc):
             await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'expired'}})
             return await m.answer('⏱️ This deposit request has expired. Please start a new deposit.')
-        await deposits.update_one({'_id':dep['_id']},{'$set':{'transaction_id':m.text.strip(),'status':'awaiting_screenshot'}})
-        return await m.answer('✅ Transaction ID received. Now send your payment screenshot here.')
+        if not value:
+            return await m.answer('Please send your transaction ID.')
+        await deposits.update_one({'_id':dep['_id']},{'$set':{'transaction_id':value,'status':'awaiting_screenshot'}})
+        return await m.answer('✅ Transaction ID received. Now send the payment screenshot here.')
     if m.from_user.id in ADMIN_IDS:
         st=await admin_states.find_one({'_id':m.from_user.id})
         if st and st.get('expires_at') and st['expires_at'] > datetime.now(timezone.utc) and st.get('action') in ('min','max'):
@@ -167,7 +171,7 @@ async def amount_or_transaction(m:Message):
     else: await m.answer(text)
 
 
-@router.message(F.text=='/admin')
+@router.message(Command('admin'))
 async def admin_panel(m:Message):
     if m.from_user.id not in ADMIN_IDS: return await m.answer('Not authorized.')
     await m.answer('🛠️ <b>Admin Panel</b>\n\nPayment settings:',reply_markup=admin_payment_kb())
@@ -188,51 +192,41 @@ async def ps_action(c:CallbackQuery):
 
 @router.message(F.photo)
 async def payment_or_qr_photo(m:Message):
+    now=datetime.now(timezone.utc)
     if m.from_user.id in ADMIN_IDS:
-        p=await get_payment_settings()
         st=await admin_states.find_one({'_id':m.from_user.id})
-        if st and st.get('action')=='qr' and st.get('expires_at',datetime.min.replace(tzinfo=timezone.utc)) > datetime.now(timezone.utc):
+        if st and st.get('action')=='qr' and st.get('expires_at') and st['expires_at'] > now:
             await settings.update_one({'_id':'payment'},{'$set':{'qr_file_id':m.photo[-1].file_id}},upsert=True)
             await admin_states.delete_one({'_id':m.from_user.id})
             return await m.answer('✅ QR Code uploaded/changed successfully.')
     dep=await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_screenshot'},sort=[('created_at',-1)])
-    if not dep: return await m.answer('First send the transaction ID for your active deposit.')
-    
-    if dep.get('expires_at') and dep['expires_at'] <= datetime.now(timezone.utc):
+    if not dep:
+        return await m.answer('First send the transaction ID for your active deposit.')
+    if dep.get('expires_at') and dep['expires_at'] <= now:
         await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'expired'}})
         return await m.answer('⏱️ This deposit request has expired. Please start a new deposit.')
     await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'pending_review','screenshot_file_id':m.photo[-1].file_id}})
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f"dep_ok:{dep['_id']}"),InlineKeyboardButton(text='❌ Reject',callback_data=f"dep_no:{dep['_id']}")]])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f"dep_ok:{dep['_id']}"),InlineKeyboardButton(text='❌ Decline',callback_data=f"dep_no:{dep['_id']}")]])
+    username=f"@{m.from_user.username}" if m.from_user.username else 'No username'
+    mention=f"<a href=\"tg://user?id={m.from_user.id}\">{m.from_user.full_name}</a>"
+    caption=(f"💳 <b>Deposit Request</b>\n\n👤 Buyer: {mention} ({username})\n"
+             f"🆔 User ID: <code>{m.from_user.id}</code>\n💰 Amount: ₹{dep['amount']:.2f}\n"
+             f"🧾 Transaction ID: <code>{dep.get('transaction_id','Not provided')}</code>")
+    sent=0
     for aid in ADMIN_IDS:
-        caption=(f"💳 <b>Deposit Request</b>\nBuyer: {m.from_user.full_name}\n"
-                 f"User ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}\n"
-                 f"Transaction ID: <code>{dep.get('transaction_id','Not provided')}</code>")
-        await bot.send_photo(aid,m.photo[-1].file_id,caption=caption,reply_markup=kb)
-    await m.answer('📨 Screenshot received. Admin will verify it.')
+        try:
+            await bot.send_photo(aid,m.photo[-1].file_id,caption=caption,reply_markup=kb)
+            sent+=1
+        except Exception:
+            logging.exception('Failed to send deposit request to admin %s', aid)
+    if sent:
+        await m.answer('📨 Screenshot received. Your payment request has been sent to the admin for verification.')
+    else:
+        # Keep the request pending so an admin can still review it later; do not silently fail.
+        await m.answer('⚠️ Screenshot received, but the admin notification could not be delivered. Please contact support.')
 
-@router.message(F.text)
-async def admin_payment_text(m:Message):
-    if m.from_user.id not in ADMIN_IDS: return
-    st=await admin_states.find_one({'_id':m.from_user.id})
-    if not st or not st.get('expires_at') or st['expires_at'] <= datetime.now(timezone.utc): return
-    action=st.get('action'); value=m.text.strip()
-    if action=='upi':
-        await settings.update_one({'_id':'payment'},{'$set':{'upi_id':value}},upsert=True); await admin_states.delete_one({'_id':m.from_user.id})
-        return await m.answer(f'✅ UPI ID changed to <code>{value}</code>.')
-    if action=='text':
-        await settings.update_one({'_id':'payment'},{'$set':{'instructions':value}},upsert=True); await admin_states.delete_one({'_id':m.from_user.id})
-        return await m.answer('✅ Payment Instructions updated.')
-    if action in ('min','max'):
-        try: v=float(value)
-        except: return await m.answer('Send a number, e.g. 100.')
-        p=await get_payment_settings(); mn=float(p.get('min_deposit',1)); mx=float(p.get('max_deposit',0))
-        if v<0: return await m.answer('Amount cannot be negative.')
-        if action=='min' and mx>0 and v>mx: return await m.answer(f'Minimum cannot be greater than maximum ₹{mx:.2f}.')
-        if action=='max' and v>0 and v<mn: return await m.answer(f'Maximum cannot be less than minimum ₹{mn:.2f}.')
-        field='min_deposit' if action=='min' else 'max_deposit'
-        await settings.update_one({'_id':'payment'},{'$set':{field:v}},upsert=True); await admin_states.delete_one({'_id':m.from_user.id})
-        label='Minimum' if action=='min' else 'Maximum'
-        return await m.answer(f'✅ {label} Deposit set to '+('No limit.' if action=='max' and v==0 else f'₹{v:.2f}.'))
+
+# Admin payment settings text is handled by text_flow above.
 
 
 
@@ -258,7 +252,7 @@ async def dep_no(c:CallbackQuery):
 @router.callback_query(F.data=='products')
 async def show_products(c:CallbackQuery):
     if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
-    ps=await products.find({'active':True}).to_list(30)
+    ps=await products.find({'active':True,'$or':[{'stock':{'$gt':0}},{'stock':{'$exists':False}}]}).to_list(30)
     rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
     await c.message.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
@@ -266,17 +260,40 @@ async def show_products(c:CallbackQuery):
 @router.callback_query(F.data.startswith('buy:'))
 async def buy(c:CallbackQuery):
     if not await is_joined(c.from_user.id): return await send_join_gate(c.message)
-    p=await products.find_one({'_id':ObjectId(c.data.split(':')[1]),'active':True})
-    if not p: return await c.answer('Unavailable.',show_alert=True)
-    u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
-    if bal<p['price']: return await c.answer('Insufficient wallet balance.',show_alert=True)
-    await users.update_one({'_id':c.from_user.id},{'$inc':{'balance':-p['price']}})
-    o={'user_id':c.from_user.id,'product_id':p['_id'],'product_name':p['name'],'amount':p['price'],'status':'pending_admin','created_at':datetime.now(timezone.utc)}
-    r=await orders.insert_one(o)
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{r.inserted_id}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{r.inserted_id}")]])
+    try:
+        pid=ObjectId(c.data.split(':',1)[1])
+    except Exception:
+        return await c.answer('Invalid product.',show_alert=True)
+    p=await products.find_one({'_id':pid,'active':True,'$or':[{'stock':{'$gt':0}},{'stock':{'$exists':False}}]})
+    if not p: return await c.answer('Out of stock or unavailable.',show_alert=True)
+    price=float(p['price'])
+    # Reserve one stock unit atomically (legacy products without stock are treated as one unit).
+    if 'stock' in p:
+        reserved=await products.update_one({'_id':pid,'active':True,'stock':{'$gt':0}},{'$inc':{'stock':-1}})
+        if reserved.modified_count!=1: return await c.answer('Out of stock.',show_alert=True)
+    else:
+        reserved=await products.update_one({'_id':pid,'active':True,'stock':{'$exists':False}},{'$set':{'stock':0}})
+        if reserved.modified_count!=1: return await c.answer('Out of stock.',show_alert=True)
+    # Deduct only if the wallet has enough balance; otherwise return the reserved unit.
+    debited=await users.update_one({'_id':c.from_user.id,'balance':{'$gte':price}},{'$inc':{'balance':-price}})
+    if debited.modified_count!=1:
+        await products.update_one({'_id':pid},{'$inc':{'stock':1}})
+        return await c.answer('Insufficient wallet balance.',show_alert=True)
+    try:
+        o={'user_id':c.from_user.id,'product_id':pid,'product_name':p['name'],'amount':price,'status':'pending_admin','created_at':datetime.now(timezone.utc)}
+        r=await orders.insert_one(o)
+    except Exception:
+        await users.update_one({'_id':c.from_user.id},{'$inc':{'balance':price}})
+        await products.update_one({'_id':pid},{'$inc':{'stock':1}})
+        return await c.answer('Order failed. Your balance and stock were restored.',show_alert=True)
+    remaining=max(int(p.get('stock',1))-1,0)
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f'ord_ok:{r.inserted_id}'),InlineKeyboardButton(text='↩️ Refund',callback_data=f'ord_ref:{r.inserted_id}')]])
     for aid in ADMIN_IDS:
-        await bot.send_message(aid,f"🛒 <b>New Order</b>\nBuyer: {c.from_user.full_name}\nUser ID: <code>{c.from_user.id}</code>\nProduct: <b>{p['name']}</b>\nAmount: ₹{p['price']:.2f}\nOrder ID: <code>{r.inserted_id}</code>",reply_markup=kb)
-    await c.message.edit_text(f"✅ <b>Order created</b>\n\nProduct: {p['name']}\nAmount: ₹{p['price']:.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.")
+        try:
+            await bot.send_message(aid,f"🛒 <b>New Order</b>\nBuyer: {c.from_user.full_name}\nUser ID: <code>{c.from_user.id}</code>\nProduct: <b>{p['name']}</b>\nAmount: ₹{price:.2f}\nRemaining stock: {remaining}\nOrder ID: <code>{r.inserted_id}</code>",reply_markup=kb)
+        except Exception:
+            logging.exception('Failed to notify admin %s about order', aid)
+    await c.message.answer(f"✅ <b>Order created</b>\n\nProduct: {p['name']}\nAmount: ₹{price:.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.")
     await c.answer()
 
 @router.callback_query(F.data.startswith('ord_ok:'))
@@ -314,7 +331,7 @@ async def require_join_message(m:Message):
 @router.message(Command("buy"))
 async def cmd_buy(m:Message):
     if not await require_join_message(m): return
-    ps=await products.find({'active':True}).to_list(30)
+    ps=await products.find({'active':True,'$or':[{'stock':{'$gt':0}},{'stock':{'$exists':False}}]}).to_list(30)
     rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
     await m.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -333,6 +350,29 @@ async def cmd_orders(m:Message):
     text='📦 <b>My Orders</b>\n\n'+('\\n'.join(f"• {o['product_name']} — ₹{o['amount']:.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
     await m.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]]))
 
+@router.message(Command('stock'))
+async def stock_list(m:Message):
+    if m.from_user.id not in ADMIN_IDS: return await m.answer('Not authorized.')
+    ps=await products.find({}).to_list(100)
+    if not ps: return await m.answer('📦 No products found.')
+    lines=['📦 <b>Product Stock</b>']
+    for p in ps:
+        stock=int(p.get('stock',1)) if p.get('stock') is not None else 1
+        lines.append(f"• <b>{p.get('name','Product')}</b> — {stock} in stock — ID: <code>{p['_id']}</code>")
+    await m.answer('\n'.join(lines))
+
+@router.message(Command('setstock'))
+async def set_stock(m:Message):
+    if m.from_user.id not in ADMIN_IDS: return await m.answer('Not authorized.')
+    parts=m.text.split()
+    if len(parts)!=3: return await m.answer('Usage: /setstock PRODUCT_ID QUANTITY')
+    try: pid=ObjectId(parts[1]); qty=int(parts[2])
+    except Exception: return await m.answer('Invalid product ID or quantity.')
+    if qty<0: return await m.answer('Quantity cannot be negative.')
+    r=await products.update_one({'_id':pid},{'$set':{'stock':qty}})
+    if r.modified_count==0: return await m.answer('Product not found or stock already had this value.')
+    await m.answer(f'✅ Stock updated to <b>{qty}</b>.')
+
 @router.message(Command("support"))
 async def cmd_support(m:Message):
     if not await require_join_message(m): return
@@ -340,21 +380,24 @@ async def cmd_support(m:Message):
     await support.insert_one({'user_id':m.from_user.id,'status':'open','expires_at':now+timedelta(minutes=5),'created_at':now})
     await m.answer('💬 <b>Support session started.</b>\nYou have 5 minutes to send your payment/order questions.')
 
-@router.message(Command("broadcast"))
+@router.message(Command('broadcast'))
 async def broadcast(m:Message):
     if m.from_user.id not in ADMIN_IDS:
         return await m.answer('Not authorized.')
     src=m.reply_to_message
     if not src:
         return await m.answer('📢 Reply to the message you want to broadcast, then send /broadcast.')
-    sent=0; failed=0
+    sent=failed=0
     async for u in users.find({}, {'_id':1}):
         uid=u['_id']
         try:
-            await bot.copy_message(chat_id=uid, from_chat_id=src.chat.id, message_id=src.message_id)
+            await bot.copy_message(chat_id=uid,from_chat_id=src.chat.id,message_id=src.message_id)
             sent+=1
-        except Exception:
+        except Exception as e:
             failed+=1
+            logging.warning('Broadcast failed for %s: %s',uid,e)
+        if (sent+failed)%20==0:
+            await asyncio.sleep(0.5)
     await m.answer(f'📢 <b>Broadcast completed</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}')
 
 @router.callback_query(F.data=='support')
