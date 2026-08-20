@@ -4,6 +4,8 @@ from bson import ObjectId
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 
@@ -17,7 +19,7 @@ FORCE_CHANNEL_URL='https://t.me/jp_network'
 START_PHOTO='https://cdn.phototourl.com/free/2026-08-20-0e143e7d-9bff-42fa-bb3c-d62a2f00de4c.png'
 if not BOT_TOKEN or not MONGO_URI or not ADMIN_IDS: raise RuntimeError('Set BOT_TOKEN, MONGO_URI and ADMIN_IDS')
 
-bot=Bot(BOT_TOKEN); dp=Dispatcher(); router=Router(); dp.include_router(router)
+bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); router=Router(); dp.include_router(router)
 db=AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
 users, deposits, products, orders, support, settings, admin_states=(db[x] for x in ('users','deposits','products','orders','support','settings','admin_states'))
 
@@ -151,6 +153,11 @@ async def wallet(c:CallbackQuery):
 @router.callback_query(F.data=='deposit')
 async def deposit(c:CallbackQuery):
     if not await joined_or_gate(c): return
+    # Starting a fresh deposit must not inherit an old unfinished deposit state.
+    await deposits.update_many(
+        {'user_id':c.from_user.id,'status':{'$in':['awaiting_txid','awaiting_screenshot']}},
+        {'$set':{'status':'cancelled','cancelled_at':datetime.now(timezone.utc)}}
+    )
     p=await get_payment_settings()
     text=(f"💳 <b>Deposit</b>\n\nSend any amount between ₹{float(p.get('min_deposit',1)):.2f}"
           f" and {('₹'+format(float(p['max_deposit']),'.2f')) if float(p.get('max_deposit',0))>0 else 'No maximum limit'}.\n\n"
