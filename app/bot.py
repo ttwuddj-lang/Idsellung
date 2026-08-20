@@ -1,10 +1,10 @@
-import asyncio, logging, os
+import asyncio, logging, os, re
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -16,7 +16,7 @@ UPI_ID=os.getenv('UPI_ID','yourupi@upi')
 FORCE_CHANNEL='@jp_network'
 FORCE_CHANNEL_URL='https://t.me/jp_network'
 START_PHOTO='https://cdn.phototourl.com/free/2026-08-20-0e143e7d-9bff-42fa-bb3c-d62a2f00de4c.png'
-DEPOSIT_WINDOW_MINUTES=5
+DEPOSIT_WINDOW_MINUTES=30
 if not BOT_TOKEN or not MONGO_URI or not ADMIN_IDS:
     raise RuntimeError('Set BOT_TOKEN, MONGO_URI and ADMIN_IDS')
 
@@ -24,6 +24,16 @@ bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp=Dispatcher(); router=Router(); dp.include_router(router)
 db=AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
 users, deposits, products, orders, support, settings=(db[x] for x in ('users','deposits','products','orders','support','settings'))
+
+
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Start / Main Menu"),
+    BotCommand(command="buy", description="Buy Products"),
+    BotCommand(command="wallet", description="Wallet & Deposit"),
+    BotCommand(command="orders", description="My Orders"),
+    BotCommand(command="support", description="Support"),
+    BotCommand(command="admin", description="Admin Panel"),
+]
 
 
 def main_kb():
@@ -46,7 +56,8 @@ def wallet_kb():
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='⚙️ Payment Settings',callback_data='admin:payment')],
-        [InlineKeyboardButton(text='📋 Manage Products',callback_data='admin:products')]
+        [InlineKeyboardButton(text='📋 Manage Products',callback_data='admin:products')],
+        [InlineKeyboardButton(text='👤 Manage User Funds',callback_data='admin:users')]
     ])
 
 
@@ -112,7 +123,7 @@ async def send_verified_start(m:Message):
           '• /wallet — Wallet &amp; Deposit\n'
           '• /orders — My Orders\n'
           '• /support — Support (5 min)\n\n'
-          'Use the buttons below or these commands to continue.')
+          'Use the buttons below or type any command above to continue.')
     await m.answer_photo(START_PHOTO,caption=text,reply_markup=main_kb())
 
 
@@ -142,13 +153,13 @@ async def require_join_for_command(m:Message):
     return True
 
 
-@router.message(F.text == '/buy')
+@router.message(Command('buy'))
 async def cmd_buy(m:Message):
     if not await require_join_for_command(m): return
     await show_products_from_message(m)
 
 
-@router.message(F.text == '/wallet')
+@router.message(Command('wallet'))
 async def cmd_wallet(m:Message):
     if not await require_join_for_command(m): return
     await save_user(m.from_user)
@@ -160,7 +171,7 @@ async def cmd_wallet(m:Message):
         reply_markup=wallet_kb())
 
 
-@router.message(F.text == '/orders')
+@router.message(Command('orders'))
 async def cmd_orders(m:Message):
     if not await require_join_for_command(m): return
     docs=await orders.find({'user_id':m.from_user.id}).sort('created_at',-1).to_list(10)
@@ -171,7 +182,7 @@ async def cmd_orders(m:Message):
         inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]]))
 
 
-@router.message(F.text == '/support')
+@router.message(Command('support'))
 async def cmd_support(m:Message):
     if not await require_join_for_command(m): return
     now=datetime.now(timezone.utc)
@@ -190,7 +201,10 @@ async def show_products_from_message(m:Message):
 
 @router.callback_query(F.data=='home')
 async def home(c:CallbackQuery):
-    await c.message.edit_text('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb())
+    if c.from_user.id not in ADMIN_IDS and not await is_joined(c.from_user.id):
+        await c.answer('❌ Join the channel first.', show_alert=True)
+        return
+    await c.message.edit_text('🛍️ <b>Waste Botz</b>\n\nChoose an option:',reply_markup=main_kb())
     await c.answer()
 
 
@@ -205,7 +219,7 @@ async def wallet(c:CallbackQuery):
           f'💎 Balance: <b>₹{bal:.2f}</b>\n'
           f'📊 Total Deposited: <b>₹{total:.2f}</b>\n\n'
           'Choose an option below.')
-    await c.message.edit_text(text,reply_markup=wallet_kb()); await c.answer()
+    await c.message.answer(text,reply_markup=wallet_kb()); await c.answer()
 
 
 @router.callback_query(F.data=='deposit')
@@ -265,7 +279,7 @@ async def deposit_history(c:CallbackQuery):
             status=d.get('status','unknown').replace('_',' ').title()
             lines.append(f'• ₹{float(d.get("amount",0)):.2f} — {status}')
         text='🧾 <b>Deposit History</b>\n\n'+'\n'.join(lines)
-    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Wallet',callback_data='wallet')]])); await c.answer()
+    await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Wallet',callback_data='wallet')]])); await c.answer()
 
 
 async def forward_deposit_to_admin(m:Message, dep):
@@ -300,6 +314,109 @@ async def payment_or_admin_photo(m:Message):
     await m.answer('📨 Screenshot received. Admin will verify your payment.')
 
 
+
+async def find_user_for_admin(identifier: str):
+    identifier = identifier.strip()
+    if identifier.startswith('@'):
+        identifier = identifier[1:]
+    if identifier.isdigit():
+        return await users.find_one({'_id': int(identifier)})
+    return await users.find_one({'username': {'$regex': f'^{re.escape(identifier)}$', '$options': 'i'}})
+
+def admin_user_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⬅️ Admin Panel', callback_data='admin:home')]
+    ])
+
+@router.callback_query(F.data=='admin:users')
+async def admin_users(c:CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer('Not authorized.',show_alert=True)
+    await c.message.edit_text(
+        '👤 <b>User Funds Manager</b>\n\n'
+        'Use these admin commands:\n\n'
+        '<code>/balance USER_ID_OR_USERNAME</code>\n'
+        '<code>/addfunds USER_ID_OR_USERNAME AMOUNT</code>\n'
+        '<code>/removefunds USER_ID_OR_USERNAME AMOUNT</code>\n\n'
+        'Example:\n'
+        '<code>/addfunds 123456789 500</code>\n'
+        '<code>/removefunds @username 100</code>',
+        reply_markup=admin_user_kb())
+    await c.answer()
+
+async def admin_user_lookup(m:Message, identifier:str):
+    u=await find_user_for_admin(identifier)
+    if not u:
+        await m.answer('❌ User not found. The user must have started the bot first.')
+        return None
+    return u
+
+@router.message(Command('balance'))
+async def admin_balance(m:Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    parts=m.text.split(maxsplit=1)
+    if len(parts)<2: return await m.answer('Usage: /balance USER_ID_OR_USERNAME')
+    u=await admin_user_lookup(m,parts[1])
+    if not u: return
+    await m.answer(
+        f'👤 <b>User Balance</b>\n\n'
+        f'Name: <b>{u.get("name","Unknown")}</b>\n'
+        f'Username: @{u.get("username") or "none"}\n'
+        f'ID: <code>{u["_id"]}</code>\n\n'
+        f'💰 Balance: <b>₹{float(u.get("balance",0)):.2f}</b>\n'
+        f'📊 Total Deposited: <b>₹{float(u.get("total_deposited",0)):.2f}</b>')
+
+@router.message(Command('addfunds'))
+async def admin_addfunds(m:Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    parts=m.text.split()
+    if len(parts)!=3: return await m.answer('Usage: /addfunds USER_ID_OR_USERNAME AMOUNT')
+    try: amount=float(parts[2])
+    except ValueError: return await m.answer('❌ Amount must be a number.')
+    if amount<=0: return await m.answer('❌ Amount must be greater than 0.')
+    u=await admin_user_lookup(m,parts[1])
+    if not u: return
+    now=datetime.now(timezone.utc)
+    await users.update_one({'_id':u['_id']},{'$inc':{'balance':amount},'$set':{'updated_at':now}})
+    await db.wallet_transactions.insert_one({
+        'user_id':u['_id'],'type':'admin_add','amount':amount,
+        'admin_id':m.from_user.id,'created_at':now
+    })
+    newbal=float(u.get('balance',0))+amount
+    await m.answer(f'✅ Added <b>₹{amount:.2f}</b> to <code>{u["_id"]}</code>.\n💰 New balance: <b>₹{newbal:.2f}</b>')
+    try:
+        await bot.send_message(u['_id'],f'💰 <b>Funds Added</b>\n₹{amount:.2f} was added to your wallet by admin.\nNew balance: ₹{newbal:.2f}')
+    except Exception: pass
+
+@router.message(Command('removefunds'))
+async def admin_removefunds(m:Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    parts=m.text.split()
+    if len(parts)!=3: return await m.answer('Usage: /removefunds USER_ID_OR_USERNAME AMOUNT')
+    try: amount=float(parts[2])
+    except ValueError: return await m.answer('❌ Amount must be a number.')
+    if amount<=0: return await m.answer('❌ Amount must be greater than 0.')
+    u=await admin_user_lookup(m,parts[1])
+    if not u: return
+    current=float(u.get('balance',0))
+    if amount>current:
+        return await m.answer(f'❌ Insufficient balance. Current balance: ₹{current:.2f}')
+    now=datetime.now(timezone.utc)
+    result=await users.update_one(
+        {'_id':u['_id'],'balance':{'$gte':amount}},
+        {'$inc':{'balance':-amount},'$set':{'updated_at':now}})
+    if result.modified_count!=1:
+        return await m.answer('❌ Balance changed; please check the balance again.')
+    await db.wallet_transactions.insert_one({
+        'user_id':u['_id'],'type':'admin_remove','amount':amount,
+        'admin_id':m.from_user.id,'created_at':now
+    })
+    newbal=current-amount
+    await m.answer(f'✅ Removed <b>₹{amount:.2f}</b> from <code>{u["_id"]}</code>.\n💰 New balance: <b>₹{newbal:.2f}</b>')
+    try:
+        await bot.send_message(u['_id'],f'💰 <b>Funds Removed</b>\n₹{amount:.2f} was removed from your wallet by admin.\nNew balance: ₹{newbal:.2f}')
+    except Exception: pass
+
 @router.message(F.text)
 async def admin_payment_text(m:Message):
     if m.from_user.id not in ADMIN_IDS: return
@@ -323,7 +440,7 @@ async def admin_payment_text(m:Message):
         return await m.answer('✅ Maximum Deposit set to '+('No limit.' if v==0 else f'₹{v:.2f}.'))
 
 
-@router.message(F.text=='/admin')
+@router.message(Command('admin'))
 async def admin_panel(m:Message):
     if m.from_user.id not in ADMIN_IDS: return await m.answer('Not authorized.')
     await m.answer('🛠️ <b>Admin Panel</b>\n\nChoose what you want to manage:',reply_markup=admin_kb())
@@ -443,7 +560,7 @@ async def show_products(c:CallbackQuery):
     ps=await products.find({'active':True}).to_list(30)
     rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{float(p['price']):.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
-    await c.message.edit_text('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
+    await c.message.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
 
 
 @router.callback_query(F.data.startswith('buy:'))
@@ -494,7 +611,7 @@ async def orders_list(c:CallbackQuery):
         await c.answer('❌ Join the channel first.',show_alert=True); return
     docs=await orders.find({'user_id':c.from_user.id}).sort('created_at',-1).to_list(10)
     text='📦 <b>My Orders</b>\n\n'+('\n'.join(f"• {o['product_name']} — ₹{float(o['amount']):.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
-    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
+    await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
 
 
 @router.callback_query(F.data=='support')
