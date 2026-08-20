@@ -18,7 +18,7 @@ if not BOT_TOKEN or not MONGO_URI or not ADMIN_IDS: raise RuntimeError('Set BOT_
 
 bot=Bot(BOT_TOKEN); dp=Dispatcher(); router=Router(); dp.include_router(router)
 db=AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
-users, deposits, products, orders, support, settings=(db[x] for x in ('users','deposits','products','orders','support','settings'))
+users, deposits, products, orders, support, settings, admin_states=(db[x] for x in ('users','deposits','products','orders','support','settings','admin_states'))
 
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -135,27 +135,44 @@ async def deposit(c:CallbackQuery):
 
 @router.message(F.text.regexp(r'^\d+(\.\d{1,2})?$'))
 async def amount(m:Message):
+    # Admin payment-setting input is kept in a separate collection so a user's
+    # deposit amount can never accidentally be interpreted as an admin setting.
+    if m.from_user.id in ADMIN_IDS:
+        state = await admin_states.find_one({'_id': m.from_user.id})
+        if state and state.get('action') in ('min','max'):
+            try:
+                v=float(m.text.strip())
+            except:
+                return await m.answer('Send a number, e.g. 100.')
+            if v < 0:
+                return await m.answer('Amount cannot be negative.')
+            p=await get_payment_settings()
+            action=state['action']
+            if action=='min' and float(p.get('max_deposit',0))>0 and v>float(p['max_deposit']):
+                return await m.answer(f"Minimum cannot be greater than maximum (₹{float(p['max_deposit']):.2f}).")
+            if action=='max' and v>0 and v<float(p.get('min_deposit',1)):
+                return await m.answer(f"Maximum cannot be less than minimum (₹{float(p.get('min_deposit',1)):.2f}).")
+            field='min_deposit' if action=='min' else 'max_deposit'
+            await settings.update_one({'_id':'payment'},{'$set':{field:v}},upsert=True)
+            await admin_states.delete_one({'_id':m.from_user.id})
+            label='Minimum' if action=='min' else 'Maximum'
+            return await m.answer(f"✅ {label} Deposit set to " + ('No limit.' if action=='max' and v==0 else f'₹{v:.2f}.'))
+
+    # Any normal numeric message from a user is a deposit amount.
     p=await get_payment_settings()
-    if m.from_user.id in ADMIN_IDS and p.get('admin_pending_user_id') == m.from_user.id and p.get('admin_pending') in ('min','max'):
-        try: v=float(m.text.strip())
-        except: return await m.answer('Send a number, e.g. 100.')
-        if v<0: return await m.answer('Amount cannot be negative.')
-        action=p['admin_pending']
-        field='min_deposit' if action=='min' else 'max_deposit'
-        await settings.update_one({'_id':'payment'},{'$set':{field:v},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
-        return await m.answer(f"✅ {'Minimum' if action=='min' else 'Maximum'} Deposit set to " + ('No limit.' if action=='max' and v==0 else f'₹{v:.2f}.'))
-    await save_user(m.from_user); amt=float(m.text)
+    await save_user(m.from_user)
+    amt=float(m.text)
     if amt<=0: return await m.answer('Enter a valid amount.')
-    if amt<float(p.get('min_deposit',1)): return await m.answer(f"Minimum deposit is ₹{float(p.get('min_deposit',1)):.2f}.")
-    if float(p.get('max_deposit',0))>0 and amt>float(p['max_deposit']): return await m.answer(f"Maximum deposit is ₹{float(p['max_deposit']):.2f}.")
+    minv=float(p.get('min_deposit',1)); maxv=float(p.get('max_deposit',0))
+    if amt<minv: return await m.answer(f"Minimum deposit is ₹{minv:.2f}.")
+    if maxv>0 and amt>maxv: return await m.answer(f"Maximum deposit is ₹{maxv:.2f}.")
     now=datetime.now(timezone.utc)
     await deposits.insert_one({'user_id':m.from_user.id,'amount':amt,'status':'awaiting_screenshot','transaction_id':None,'created_at':now,'expires_at':now+timedelta(minutes=30)})
     text=(f"💳 <b>Deposit Request</b>\nAmount: ₹{amt:.2f}\nUPI: <code>{p['upi_id']}</code>\n\n"
           f"{p['instructions']}\n\nComplete payment and send screenshot.")
     if p.get('qr_file_id'):
         await bot.send_photo(m.chat.id,p['qr_file_id'],caption=text)
-    else:
-        await m.answer(text)
+    else: await m.answer(text)
 
 
 @router.message(Command('admin'))
@@ -173,7 +190,7 @@ async def ps_action(c:CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
     action=c.data.split(':',1)[1]
     prompts={'upi':'Send the new UPI ID.','text':'Send the new payment instructions.','min':'Send the minimum deposit amount, e.g. 10.','max':'Send the maximum deposit amount, e.g. 5000. Send 0 for no limit.','qr':'Send the new QR image as a photo.'}
-    await settings.update_one({'_id':'payment'},{'$set':{'admin_pending':action,'admin_pending_user_id':c.from_user.id}},upsert=True)
+    await admin_states.update_one({'_id':c.from_user.id},{'$set':{'action':action}},upsert=True)
     await c.message.answer('✏️ '+prompts[action])
     await c.answer()
 
@@ -181,8 +198,10 @@ async def ps_action(c:CallbackQuery):
 async def payment_or_qr_photo(m:Message):
     if m.from_user.id in ADMIN_IDS:
         p=await get_payment_settings()
-        if p.get('admin_pending')=='qr':
-            await settings.update_one({'_id':'payment'},{'$set':{'qr_file_id':m.photo[-1].file_id},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
+        state=await admin_states.find_one({'_id':m.from_user.id})
+        if state and state.get('action')=='qr':
+            await settings.update_one({'_id':'payment'},{'$set':{'qr_file_id':m.photo[-1].file_id}},upsert=True)
+            await admin_states.delete_one({'_id':m.from_user.id})
             return await m.answer('✅ QR Code uploaded/changed successfully.')
     dep=await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_screenshot'},sort=[('created_at',-1)])
     if not dep: return await m.answer('Start a deposit first.')
