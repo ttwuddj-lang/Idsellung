@@ -163,7 +163,20 @@ async def deposit(c:CallbackQuery):
 
 @router.message(F.text.regexp(r'^\d+(\.\d{1,2})?$'))
 async def amount(m:Message):
-    # Never interpret a user's numeric message as an admin setting.
+    # If the user is currently expected to send a transaction ID, ALWAYS
+    # treat the message as the transaction ID, even when it is only digits.
+    # This prevents numeric transaction IDs from being mistaken for deposit
+    # amounts or admin min/max settings.
+    active_dep=await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_txid'},sort=[('created_at',-1)])
+    if active_dep:
+        exp=active_dep.get('expires_at'); now=datetime.now(timezone.utc)
+        if exp and exp.tzinfo is None: exp=exp.replace(tzinfo=timezone.utc)
+        if exp and exp<=now:
+            await deposits.update_one({'_id':active_dep['_id']},{'$set':{'status':'expired'}})
+            return await m.answer('⏱️ This deposit request has expired. Start a new deposit.')
+        await deposits.update_one({'_id':active_dep['_id']},{'$set':{'status':'awaiting_screenshot','transaction_id':m.text.strip()}})
+        return await m.answer('🧾 Transaction ID received. Now send the payment screenshot.')
+
     if m.from_user.id in ADMIN_IDS:
         action=await get_admin_state(m.from_user.id)
         if action in ('min','max'):
