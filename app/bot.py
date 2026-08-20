@@ -136,13 +136,13 @@ async def deposit(c:CallbackQuery):
 @router.message(F.text.regexp(r'^\d+(\.\d{1,2})?$'))
 async def amount(m:Message):
     p=await get_payment_settings()
-    if m.from_user.id in ADMIN_IDS and p.get('admin_pending') in ('min','max'):
+    if m.from_user.id in ADMIN_IDS and p.get('admin_pending_user_id') == m.from_user.id and p.get('admin_pending') in ('min','max'):
         try: v=float(m.text.strip())
         except: return await m.answer('Send a number, e.g. 100.')
         if v<0: return await m.answer('Amount cannot be negative.')
         action=p['admin_pending']
         field='min_deposit' if action=='min' else 'max_deposit'
-        await settings.update_one({'_id':'payment'},{'$set':{field:v},'$unset':{'admin_pending':''}})
+        await settings.update_one({'_id':'payment'},{'$set':{field:v},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
         return await m.answer(f"✅ {'Minimum' if action=='min' else 'Maximum'} Deposit set to " + ('No limit.' if action=='max' and v==0 else f'₹{v:.2f}.'))
     await save_user(m.from_user); amt=float(m.text)
     if amt<=0: return await m.answer('Enter a valid amount.')
@@ -173,7 +173,7 @@ async def ps_action(c:CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
     action=c.data.split(':',1)[1]
     prompts={'upi':'Send the new UPI ID.','text':'Send the new payment instructions.','min':'Send the minimum deposit amount, e.g. 10.','max':'Send the maximum deposit amount, e.g. 5000. Send 0 for no limit.','qr':'Send the new QR image as a photo.'}
-    await settings.update_one({'_id':'payment'},{'$set':{'admin_pending':action}},upsert=True)
+    await settings.update_one({'_id':'payment'},{'$set':{'admin_pending':action,'admin_pending_user_id':c.from_user.id}},upsert=True)
     await c.message.answer('✏️ '+prompts[action])
     await c.answer()
 
@@ -182,7 +182,7 @@ async def payment_or_qr_photo(m:Message):
     if m.from_user.id in ADMIN_IDS:
         p=await get_payment_settings()
         if p.get('admin_pending')=='qr':
-            await settings.update_one({'_id':'payment'},{'$set':{'qr_file_id':m.photo[-1].file_id},'$unset':{'admin_pending':''}})
+            await settings.update_one({'_id':'payment'},{'$set':{'qr_file_id':m.photo[-1].file_id},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
             return await m.answer('✅ QR Code uploaded/changed successfully.')
     dep=await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_screenshot'},sort=[('created_at',-1)])
     if not dep: return await m.answer('Start a deposit first.')
@@ -201,22 +201,22 @@ async def payment_or_qr_photo(m:Message):
 async def text_router(m:Message):
     # Admin setting input has priority.
     if m.from_user.id in ADMIN_IDS:
-        p=await get_payment_settings(); action=p.get('admin_pending')
+        p=await get_payment_settings(); action=p.get('admin_pending') if p.get('admin_pending_user_id') == m.from_user.id else None
         if action:
             value=m.text.strip()
             if action=='upi':
                 if not value: return await m.answer('Send a valid UPI ID.')
-                await settings.update_one({'_id':'payment'},{'$set':{'upi_id':value},'$unset':{'admin_pending':''}})
+                await settings.update_one({'_id':'payment'},{'$set':{'upi_id':value},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
                 return await m.answer(f'✅ UPI ID changed to <code>{value}</code>.')
             if action=='text':
-                await settings.update_one({'_id':'payment'},{'$set':{'instructions':value},'$unset':{'admin_pending':''}})
+                await settings.update_one({'_id':'payment'},{'$set':{'instructions':value},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
                 return await m.answer('✅ Payment Instructions updated.')
             if action in ('min','max'):
                 try: v=float(value)
                 except: return await m.answer('Send a number, e.g. 100.')
                 if v<0: return await m.answer('Amount cannot be negative.')
                 field='min_deposit' if action=='min' else 'max_deposit'
-                await settings.update_one({'_id':'payment'},{'$set':{field:v},'$unset':{'admin_pending':''}})
+                await settings.update_one({'_id':'payment'},{'$set':{field:v},'$unset':{'admin_pending':'','admin_pending_user_id':''}})
                 return await m.answer(f"✅ {'Minimum' if action=='min' else 'Maximum'} Deposit set to " + ('No limit.' if action=='max' and v==0 else f'₹{v:.2f}.'))
 
         # Reply to a support notification to answer the user.
