@@ -106,13 +106,19 @@ async def verify_join(c:CallbackQuery):
 
 @router.callback_query(F.data=='home')
 async def home(c:CallbackQuery):
-    await c.message.edit_text('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb()); await c.answer()
+    await c.answer()
+    await c.message.answer('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb())
 
 @router.callback_query(F.data=='wallet')
 async def wallet(c:CallbackQuery):
+    if not await is_joined(c.from_user.id):
+        await c.answer('❌ Please join the channel first.', show_alert=True)
+        return
+    await save_user(c.from_user)
     u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Deposit',callback_data='deposit')],[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])
-    await c.message.edit_text(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb); await c.answer()
+    await c.answer()
+    await c.message.answer(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb)
 
 @router.callback_query(F.data=='deposit')
 async def deposit(c:CallbackQuery):
@@ -335,10 +341,15 @@ async def cmd_removefunds(m:Message):
 
 @router.callback_query(F.data=='products')
 async def show_products(c:CallbackQuery):
+    if not await is_joined(c.from_user.id):
+        await c.answer('❌ Please join the channel first.', show_alert=True)
+        return
+    await save_user(c.from_user)
     ps=await products.find({'active':True}).to_list(30)
     rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{p['price']:.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
-    await c.message.edit_text('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
+    await c.answer()
+    await c.message.answer('🛒 <b>Products</b>\n\nChoose a product:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith('buy:'))
 async def buy(c:CallbackQuery):
@@ -352,8 +363,8 @@ async def buy(c:CallbackQuery):
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{r.inserted_id}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{r.inserted_id}")]])
     for aid in ADMIN_IDS:
         await bot.send_message(aid,f"🛒 <b>New Order</b>\nBuyer: {c.from_user.full_name}\nUser ID: <code>{c.from_user.id}</code>\nProduct: <b>{p['name']}</b>\nAmount: ₹{p['price']:.2f}\nOrder ID: <code>{r.inserted_id}</code>",reply_markup=kb)
-    await c.message.edit_text(f"✅ <b>Order created</b>\n\nProduct: {p['name']}\nAmount: ₹{p['price']:.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.")
     await c.answer()
+    await c.message.answer(f"✅ <b>Order created</b>\n\nProduct: {p['name']}\nAmount: ₹{p['price']:.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.")
 
 @router.callback_query(F.data.startswith('ord_ok:'))
 async def ord_ok(c:CallbackQuery):
@@ -376,12 +387,19 @@ async def ord_ref(c:CallbackQuery):
 
 @router.callback_query(F.data=='orders')
 async def orders_list(c:CallbackQuery):
+    if not await is_joined(c.from_user.id):
+        await c.answer('❌ Please join the channel first.', show_alert=True)
+        return
     docs=await orders.find({'user_id':c.from_user.id}).sort('created_at',-1).to_list(10)
     text='📦 <b>My Orders</b>\n\n'+('\n'.join(f"• {o['product_name']} — ₹{o['amount']:.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
-    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
+    await c.answer()
+    await c.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]]))
 
 @router.callback_query(F.data=='support')
 async def support_start(c:CallbackQuery):
+    if not await is_joined(c.from_user.id):
+        await c.answer('❌ Please join the channel first.', show_alert=True)
+        return
     now=datetime.now(timezone.utc)
     await support.insert_one({'user_id':c.from_user.id,'status':'open','expires_at':now+timedelta(minutes=5),'created_at':now})
     await c.message.answer('💬 <b>Support session started.</b>\nYou have 5 minutes to send your payment/order questions.'); await c.answer()
