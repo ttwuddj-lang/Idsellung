@@ -1,11 +1,14 @@
 # WasteBotz
 
-## Run
+Railway start command:
+`python -m app.bot`
 
-python -m app.bot
+Admin inventory:
+- /admin -> Add Account / Remove Account / Account Stock
+- Add Account asks Country -> Number -> Price
+- Remove Account asks Number
+- Account Stock shows active inventory grouped by country
+- Buy Products shows countries, then numbers and prices
+- A sold number is immediately removed from active stock
 
-Set BOT_TOKEN, MONGO_URI and ADMIN_IDS in Railway Variables.
-
-## Payment flow
-Amount -> Transaction ID -> Screenshot -> Admin Approve/Decline.
-Numeric transaction IDs are handled correctly and are not treated as deposit amounts.
+Payment settings remain in the same admin panel.
