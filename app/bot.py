@@ -452,10 +452,25 @@ async def admin_reply_otp(m:Message):
     if m.from_user.id not in ADMIN_IDS or not m.reply_to_message:
         return
     replied=m.reply_to_message
-    # Only accept replies to the bot's own New Order message.
+    # The owner normally replies to the bot's instruction message:
+    # "📨 Send the number OTP by replying to this buyer order message."
+    # That instruction itself is a reply to the original New Order message.
+    # Accept both reply styles: directly replying to New Order OR replying to
+    # the instruction message, without changing the rest of the order flow.
     if not replied.from_user or replied.from_user.id != (await bot.get_me()).id:
         return
-    o=await orders.find_one({'admin_message_ids':replied.message_id,'status':'confirmed','otp_pending':True})
+
+    order_message_id = replied.message_id
+    if replied.reply_to_message and replied.reply_to_message.from_user and \
+            replied.reply_to_message.from_user.id == (await bot.get_me()).id:
+        # If this is the instruction message, its parent is the New Order.
+        order_message_id = replied.reply_to_message.message_id
+
+    o=await orders.find_one({
+        'admin_message_ids': order_message_id,
+        'status': 'confirmed',
+        'otp_pending': True
+    })
     if not o:
         return
     otp=m.text.strip()
