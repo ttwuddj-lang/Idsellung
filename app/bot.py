@@ -107,13 +107,13 @@ async def verify_join(c:CallbackQuery):
 
 @router.callback_query(F.data=='home')
 async def home(c:CallbackQuery):
-    await c.message.edit_text('🛍️ <b>Digital Store</b>\n\nChoose an option:',reply_markup=main_kb()); await c.answer()
+    await update_menu_message(c,'🛍️ <b>Digital Store</b>\n\nChoose an option:',main_kb()); await c.answer()
 
 @router.callback_query(F.data=='wallet')
 async def wallet(c:CallbackQuery):
     u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Deposit',callback_data='deposit')],[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])
-    await c.message.edit_text(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb); await c.answer()
+    await update_menu_message(c,f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',kb); await c.answer()
 
 @router.callback_query(F.data=='deposit')
 async def deposit(c:CallbackQuery):
@@ -161,6 +161,14 @@ def inventory_admin_kb():
 
 def main_menu_text():
     return '🛍️ <b>Waste Botz</b>\n\nChoose an option:'
+
+async def update_menu_message(c: CallbackQuery, text: str, reply_markup):
+    # /start shows the main menu as a photo; edit_caption is required for that message.
+    if c.message.photo:
+        await c.message.edit_caption(caption=text, reply_markup=reply_markup)
+    else:
+        await c.message.edit_text(text, reply_markup=reply_markup)
+
 
 @router.message(F.text == '/buy')
 async def cmd_buy(m:Message):
@@ -224,31 +232,17 @@ async def inv_stock(c:CallbackQuery):
 
 @router.callback_query(F.data == 'inv:add')
 async def inv_add_start(c:CallbackQuery):
-    if c.from_user.id not in ADMIN_IDS:
-        return await c.answer('Not authorized.', show_alert=True)
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
     sid=f'inventory_session:{c.from_user.id}'
-    await settings.update_one(
-        {'_id':sid},
-        {'$set':{'pending':'add_country','admin_id':c.from_user.id},
-         '$unset':{'country':'','number':''}},
-        upsert=True
-    )
-    await c.message.answer('🌍 Add Account\n\nSend the Country name.')
-    await c.answer()
+    await settings.update_one({'_id':sid},{'$set':{'pending':'add_country','admin_id':c.from_user.id},'$unset':{'country':'','number':''}},upsert=True)
+    await c.message.answer('Add Account\n\nSend the Country name.'); await c.answer()
 
 @router.callback_query(F.data == 'inv:remove')
 async def inv_remove_start(c:CallbackQuery):
-    if c.from_user.id not in ADMIN_IDS:
-        return await c.answer('Not authorized.', show_alert=True)
+    if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
     sid=f'inventory_session:{c.from_user.id}'
-    await settings.update_one(
-        {'_id':sid},
-        {'$set':{'pending':'remove_number','admin_id':c.from_user.id},
-         '$unset':{'country':'','number':''}},
-        upsert=True
-    )
-    await c.message.answer('➖ Remove Account\n\nSend the exact number to remove from stock.')
-    await c.answer()
+    await settings.update_one({'_id':sid},{'$set':{'pending':'remove_number','admin_id':c.from_user.id},'$unset':{'country':'','number':''}},upsert=True)
+    await c.message.answer('Remove Account\n\nSend the exact number to remove from stock.'); await c.answer()
 
 
 @router.callback_query(F.data=='ps:view')
@@ -282,76 +276,35 @@ async def payment_or_qr_photo(m:Message):
 
 @router.message(F.text)
 async def admin_payment_text(m:Message):
-    if m.from_user.id not in ADMIN_IDS:
-        return
-
-    value=m.text.strip()
+    if m.from_user.id not in ADMIN_IDS: return
     sid=f'inventory_session:{m.from_user.id}'
     inv=await settings.find_one({'_id':sid})
     inv_pending=(inv or {}).get('pending')
-
-    # Inventory flow is kept separate from payment settings so a country/number/price
-    # message can never be mistaken for a minimum/maximum deposit setting.
+    value=m.text.strip()
     if inv_pending:
         if inv_pending=='add_country':
-            await settings.update_one(
-                {'_id':sid},
-                {'$set':{'pending':'add_number','country':value}}
-            )
-            return await m.answer('📱 Add Account\n\nSend the number.')
-
+            await settings.update_one({'_id':sid},{'$set':{'pending':'add_number','country':value}})
+            return await m.answer('2️⃣ Send the <b>number</b>.')
         if inv_pending=='add_number':
-            await settings.update_one(
-                {'_id':sid},
-                {'$set':{'pending':'add_price','number':value}}
-            )
-            return await m.answer('💰 Add Account\n\nSend the price, e.g. 95.')
-
+            await settings.update_one({'_id':sid},{'$set':{'pending':'add_price','number':value}})
+            return await m.answer('3️⃣ Send the <b>price</b>, e.g. <code>95</code>.')
         if inv_pending=='add_price':
-            try:
-                price=float(value)
-            except ValueError:
-                return await m.answer('❌ Send a valid price, e.g. 95.')
-            if price<=0:
-                return await m.answer('❌ Price must be greater than 0.')
-
-            country=inv.get('country','Unknown')
-            number=inv.get('number','')
+            try: price=float(value)
+            except: return await m.answer('Send a valid price, e.g. 95.')
+            if price<=0: return await m.answer('Price must be greater than 0.')
+            country=inv.get('country','Unknown'); number=inv.get('number','')
             exists=await products.find_one({'number':number,'active':True})
             if exists:
                 return await m.answer('❌ This number is already in stock.')
-
-            await products.insert_one({
-                'name':number,'number':number,'country':country,'price':price,
-                'active':True,'created_at':datetime.now(timezone.utc)
-            })
-            await settings.update_one(
-                {'_id':sid},
-                {'$set':{'pending':None},'$unset':{'country':'','number':'','admin_id':''}}
-            )
-            return await m.answer(
-                f'✅ Account added.\n\nCountry: {country}\nNumber: {number}\nPrice: ₹{price:.2f}'
-            )
-
+            await products.insert_one({'name':number,'number':number,'country':country,'price':price,'active':True,'created_at':datetime.now(timezone.utc)})
+            await settings.update_one({'_id':sid},{'$unset':{'pending':'','country':'','number':'','admin_id':''}})
+            return await m.answer(f'✅ Account added.\n🌍 Country: <b>{country}</b>\n📱 Number: <code>{number}</code>\n💰 Price: ₹{price:.2f}')
         if inv_pending=='remove_number':
-            r=await products.update_one(
-                {'number':value,'active':True},
-                {'$set':{'active':False,'removed_at':datetime.now(timezone.utc)}}
-            )
-            await settings.update_one(
-                {'_id':sid},
-                {'$set':{'pending':None},'$unset':{'admin_id':''}}
-            )
-            return await m.answer(
-                '✅ Account removed from stock.' if r.modified_count
-                else '❌ Number not found in active stock.'
-            )
-
-    # Existing payment-settings flow remains unchanged.
-    p=await get_payment_settings()
-    action=p.get('admin_pending')
-    if not action:
-        return
+            r=await products.update_one({'number':value,'active':True},{'$set':{'active':False,'removed_at':datetime.now(timezone.utc)}})
+            await settings.update_one({'_id':sid},{'$unset':{'pending':'','admin_id':''}})
+            return await m.answer('✅ Account removed from stock.' if r.modified_count else '❌ Number not found in active stock.')
+    p=await get_payment_settings(); action=p.get('admin_pending')
+    if not action: return
     if action=='upi':
         if not value: return await m.answer('Send a valid UPI ID.')
         await settings.update_one({'_id':'payment'},{'$set':{'upi_id':value},'$unset':{'admin_pending':''}})
@@ -361,7 +314,7 @@ async def admin_payment_text(m:Message):
         await m.answer('✅ Payment Instructions updated.')
     elif action in ('min','max'):
         try: v=float(value)
-        except ValueError: return await m.answer('Send a number, e.g. 100.')
+        except: return await m.answer('Send a number, e.g. 100.')
         if v<0: return await m.answer('Amount cannot be negative.')
         if action=='min':
             await settings.update_one({'_id':'payment'},{'$set':{'min_deposit':v},'$unset':{'admin_pending':''}})
@@ -370,6 +323,15 @@ async def admin_payment_text(m:Message):
             await settings.update_one({'_id':'payment'},{'$set':{'max_deposit':v},'$unset':{'admin_pending':''}})
             await m.answer('✅ Maximum Deposit set to '+('No limit.' if v==0 else f'₹{v:.2f}.'))
 
+
+async def screenshot(m:Message):
+    dep=await deposits.find_one({'user_id':m.from_user.id,'status':'awaiting_screenshot'},sort=[('created_at',-1)])
+    if not dep: return await m.answer('Start a deposit first.')
+    await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'pending_review','screenshot_file_id':m.photo[-1].file_id}})
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f"dep_ok:{dep['_id']}"),InlineKeyboardButton(text='❌ Reject',callback_data=f"dep_no:{dep['_id']}")]])
+    for aid in ADMIN_IDS:
+        await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>Deposit Request</b>\nBuyer: {m.from_user.full_name}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
+    await m.answer('📨 Screenshot received. Admin will verify it.')
 
 @router.callback_query(F.data.startswith('dep_ok:'))
 async def dep_ok(c:CallbackQuery):
@@ -399,7 +361,7 @@ async def show_products(c:CallbackQuery):
     else:
         rows=[[InlineKeyboardButton(text=f"{p['name']} — ₹{float(p['price']):.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')])
-    await c.message.edit_text('🛒 <b>Products</b>\n\nChoose a country:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
+    await update_menu_message(c,'🛒 <b>Products</b>\n\nChoose a country:',InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
 
 @router.callback_query(F.data.startswith('country:'))
 async def country_products(c:CallbackQuery):
@@ -407,7 +369,7 @@ async def country_products(c:CallbackQuery):
     ps=await products.find({'active':True,'country':country}).to_list(100)
     rows=[[InlineKeyboardButton(text=f"{p.get('number',p['name'])} — ₹{float(p['price']):.2f}",callback_data=f"buy:{p['_id']}")] for p in ps]
     rows.append([InlineKeyboardButton(text='⬅️ Countries',callback_data='products')])
-    await c.message.edit_text(f'🌍 <b>{country}</b>\n\nChoose an account:',reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
+    await update_menu_message(c,f'🌍 <b>{country}</b>\n\nChoose an account:',InlineKeyboardMarkup(inline_keyboard=rows)); await c.answer()
 
 @router.callback_query(F.data.startswith('buy:'))
 async def buy(c:CallbackQuery):
@@ -421,7 +383,7 @@ async def buy(c:CallbackQuery):
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{r.inserted_id}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{r.inserted_id}")]])
     for aid in ADMIN_IDS:
         await bot.send_message(aid,f"🛒 <b>New Order</b>\nBuyer: {c.from_user.full_name}\nUser ID: <code>{c.from_user.id}</code>\nCountry: <b>{p.get('country','Unknown')}</b>\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{float(p['price']):.2f}\nOrder ID: <code>{r.inserted_id}</code>",reply_markup=kb)
-    await c.message.edit_text(f"✅ <b>Order created</b>\n\nCountry: {p.get('country','Unknown')}\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{float(p['price']):.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.")
+    await update_menu_message(c,f"✅ <b>Order created</b>\n\nCountry: {p.get('country','Unknown')}\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{float(p['price']):.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.",None)
     await c.answer()
 
 @router.callback_query(F.data.startswith('ord_ok:'))
@@ -447,7 +409,7 @@ async def ord_ref(c:CallbackQuery):
 async def orders_list(c:CallbackQuery):
     docs=await orders.find({'user_id':c.from_user.id}).sort('created_at',-1).to_list(10)
     text='📦 <b>My Orders</b>\n\n'+('\n'.join(f"• {o['product_name']} — ₹{o['amount']:.2f} — {o['status']}" for o in docs) if docs else 'No orders yet.')
-    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
+    await update_menu_message(c,text,InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])); await c.answer()
 
 @router.callback_query(F.data=='support')
 async def support_start(c:CallbackQuery):
