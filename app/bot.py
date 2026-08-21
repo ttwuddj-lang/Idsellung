@@ -110,7 +110,7 @@ users, deposits, products, orders, support, settings=(db[x] for x in ('users','d
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🛒 Buy Products',callback_data='products')],
-        [InlineKeyboardButton(text='💰 Wallet / Deposit',callback_data='wallet')],
+        [InlineKeyboardButton(text='💰 Wallet Balance',callback_data='wallet')],
         [InlineKeyboardButton(text='📦 My Orders',callback_data='orders')],
         [InlineKeyboardButton(text='💬 Support (5 min)',callback_data='support')]])
 
@@ -284,7 +284,21 @@ async def cmd_wallet(m:Message):
     if not await is_joined(m.from_user.id): return await send_join_gate(m)
     u=await users.find_one({'_id':m.from_user.id}); bal=float((u or {}).get('balance',0))
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='➕ Deposit',callback_data='deposit')],[InlineKeyboardButton(text='🏠 Main Menu',callback_data='home')]])
-    await m.answer(f'💰 <b>Wallet</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb)
+    await m.answer(f'💰 <b>Wallet Balance</b>\n\nBalance: <b>₹{bal:.2f}</b>',reply_markup=kb)
+
+@router.message(F.text == '/deposit')
+async def cmd_deposit(m:Message):
+    if not await is_joined(m.from_user.id): return await send_join_gate(m)
+    p=await get_payment_settings()
+    text=(f"💳 <b>Deposit</b>\n\nSend any amount between ₹{float(p.get('min_deposit',1)):.2f}"
+          f" and {('₹'+format(float(p['max_deposit']),'.2f')) if float(p.get('max_deposit',0))>0 else 'No maximum limit'}.\n\n"
+          f"UPI ID: <code>{p['upi_id']}</code>\n\n{p['instructions']}\n\n"
+          "After payment, send the screenshot here. Balance is added only after admin verification.")
+    await users.update_one({'_id':m.from_user.id},{'$set':{'deposit_pending':True}},upsert=True)
+    if p.get('qr_file_id'):
+        await bot.send_photo(m.chat.id,p['qr_file_id'],caption=text)
+    else:
+        await m.answer(text)
 
 @router.message(F.text == '/orders')
 async def cmd_orders(m:Message):
@@ -360,6 +374,11 @@ async def ps_action(c:CallbackQuery):
     await c.message.answer('✏️ '+prompts[action])
     await c.answer()
 
+def user_mention(u):
+    label = f'@{u.username}' if u.username else (u.full_name or 'User')
+    label = _html.escape(label)
+    return f'<a href="tg://user?id={u.id}">{label}</a>'
+
 @router.message(F.photo)
 async def payment_or_qr_photo(m:Message):
     if m.from_user.id in ADMIN_IDS:
@@ -372,7 +391,7 @@ async def payment_or_qr_photo(m:Message):
     await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'pending_review','screenshot_file_id':m.photo[-1].file_id}})
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f"dep_ok:{dep['_id']}"),InlineKeyboardButton(text='❌ Reject',callback_data=f"dep_no:{dep['_id']}")]])
     for aid in ADMIN_IDS:
-        await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>Deposit Request</b>\nBuyer: {m.from_user.full_name}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
+        await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>New Deposit</b>\nBuyer: {user_mention(m.from_user)}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
     await m.answer('📨 Screenshot received. Admin will verify it.')
 
 async def find_user_for_admin(identifier: str):
@@ -427,6 +446,24 @@ async def admin_removefund(m:Message):
         await bot.send_message(u['_id'],f'💰 <b>Funds Removed</b>\n₹{amount:.2f} was removed from your wallet by admin.\nNew balance: ₹{newbal:.2f}')
     except Exception:
         pass
+
+@router.message(F.reply_to_message, F.text)
+async def admin_reply_otp(m:Message):
+    if m.from_user.id not in ADMIN_IDS or not m.reply_to_message:
+        return
+    replied=m.reply_to_message
+    # Only accept replies to the bot's own New Order message.
+    if not replied.from_user or replied.from_user.id != (await bot.get_me()).id:
+        return
+    o=await orders.find_one({'admin_message_ids':replied.message_id,'status':'confirmed','otp_pending':True})
+    if not o:
+        return
+    otp=m.text.strip()
+    if not otp:
+        return await m.answer('Send the OTP as a reply to the buyer order message.')
+    await bot.send_message(o['user_id'],f"🔐 <b>Number OTP</b>\n\n<code>{_html.escape(otp)}</code>")
+    await orders.update_one({'_id':o['_id']},{'$set':{'otp_pending':False,'otp_sent_at':datetime.now(timezone.utc),'otp_sent_by':m.from_user.id}})
+    await m.answer('✅ OTP sent to the buyer.')
 
 @router.message(F.text)
 async def admin_payment_text(m:Message):
@@ -484,7 +521,7 @@ async def screenshot(m:Message):
     await deposits.update_one({'_id':dep['_id']},{'$set':{'status':'pending_review','screenshot_file_id':m.photo[-1].file_id}})
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Approve',callback_data=f"dep_ok:{dep['_id']}"),InlineKeyboardButton(text='❌ Reject',callback_data=f"dep_no:{dep['_id']}")]])
     for aid in ADMIN_IDS:
-        await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>Deposit Request</b>\nBuyer: {m.from_user.full_name}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
+        await bot.send_photo(aid,m.photo[-1].file_id,caption=f"💳 <b>New Deposit</b>\nBuyer: {user_mention(m.from_user)}\nUser ID: <code>{m.from_user.id}</code>\nAmount: ₹{dep['amount']:.2f}",reply_markup=kb)
     await m.answer('📨 Screenshot received. Admin will verify it.')
 
 @router.callback_query(F.data.startswith('dep_ok:'))
@@ -542,17 +579,42 @@ async def account_preview(c:CallbackQuery):
 
 @router.callback_query(F.data.startswith('buy:'))
 async def buy(c:CallbackQuery):
-    p=await products.find_one({'_id':ObjectId(c.data.split(':')[1]),'active':True})
-    if not p: return await c.answer('Unavailable.',show_alert=True)
-    u=await users.find_one({'_id':c.from_user.id}); bal=float((u or {}).get('balance',0))
-    if bal<p['price']: return await c.answer('Insufficient wallet balance.',show_alert=True)
-    await users.update_one({'_id':c.from_user.id},{'$inc':{'balance':-p['price']}})
-    o={'user_id':c.from_user.id,'product_id':p['_id'],'product_name':p['name'],'amount':p['price'],'country':p.get('country','Unknown'),'number':p.get('number',p['name']),'status':'pending_admin','created_at':datetime.now(timezone.utc)}
-    r=await orders.insert_one(o)
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{r.inserted_id}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{r.inserted_id}")]])
+    pid=ObjectId(c.data.split(':')[1])
+    # Reserve the exact stock item first. If two users tap at once, only one can reserve it.
+    p=await products.find_one_and_delete({'_id':pid,'active':True})
+    if not p:
+        return await c.answer('Unavailable — this number has already been sold.',show_alert=True)
+    price=float(p.get('price',0))
+    # Charge the wallet atomically. Restore stock if the balance is insufficient.
+    bal_update=await users.update_one({'_id':c.from_user.id,'balance':{'$gte':price}},{'$inc':{'balance':-price}})
+    if bal_update.modified_count!=1:
+        await products.insert_one(p)
+        return await c.answer('Insufficient wallet balance.',show_alert=True)
+    o={'user_id':c.from_user.id,'product_id':p['_id'],'product_name':p['name'],'amount':price,'country':p.get('country','Unknown'),'number':p.get('number',p['name']),'status':'pending_admin','created_at':datetime.now(timezone.utc)}
+    try:
+        r=await orders.insert_one(o)
+    except Exception:
+        await users.update_one({'_id':c.from_user.id},{'$inc':{'balance':price}})
+        await products.insert_one(p)
+        return await c.answer('Order could not be created. Your balance was restored.',show_alert=True)
+    oid=r.inserted_id
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Confirm',callback_data=f"ord_ok:{oid}"),InlineKeyboardButton(text='↩️ Refund',callback_data=f"ord_ref:{oid}")]])
+    admin_message_ids=[]
+    caption=(f"🛒 <b>New Order</b>\n"
+             f"𝐁ᴜʏᴇʀ: {user_mention(c.from_user)}\n"
+             f"𝐔sᴇʀ 𝐈ᴅ: <code>{c.from_user.id}</code>\n"
+             f"𝐂ᴏᴜɴᴛʀʏ: <b>{p.get('country','Unknown')}</b>\n"
+             f"𝐍ᴜᴍʙᴇʀ: <code>{p.get('number',p['name'])}</code>\n"
+             f"𝐀ᴍᴏᴜɴᴛ: ₹{price:.2f}\n"
+             f"𝐎ʀᴅᴇʀ 𝐈ᴅ: <code>{oid}</code>")
     for aid in ADMIN_IDS:
-        await bot.send_message(aid,f"🛒 <b>New Order</b>\nBuyer: {c.from_user.full_name}\nUser ID: <code>{c.from_user.id}</code>\nCountry: <b>{p.get('country','Unknown')}</b>\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{float(p['price']):.2f}\nOrder ID: <code>{r.inserted_id}</code>",reply_markup=kb)
-    await update_menu_message(c,f"✅ <b>Order created</b>\n\nCountry: {p.get('country','Unknown')}\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{float(p['price']):.2f}\nOrder ID: <code>{r.inserted_id}</code>\n\nAdmin will confirm your order.",None)
+        try:
+            am=await bot.send_message(aid,caption,reply_markup=kb)
+            admin_message_ids.append(am.message_id)
+        except Exception:
+            pass
+    await orders.update_one({'_id':oid},{'$set':{'admin_message_ids':admin_message_ids}})
+    await update_menu_message(c,f"✅ <b>Order created</b>\n\nCountry: {p.get('country','Unknown')}\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{price:.2f}\nOrder ID: <code>{oid}</code>\n\nAdmin will confirm your order.",None)
     await c.answer()
 
 @router.callback_query(F.data.startswith('ord_ok:'))
@@ -560,9 +622,11 @@ async def ord_ok(c:CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer('Not authorized.',show_alert=True)
     oid=ObjectId(c.data.split(':')[1]); o=await orders.find_one({'_id':oid})
     if not o or o['status']!='pending_admin': return await c.answer('Already processed.',show_alert=True)
-    await orders.update_one({'_id':oid},{'$set':{'status':'confirmed','confirmed_by':c.from_user.id,'confirmed_at':datetime.now(timezone.utc)}})
-    await bot.send_message(o['user_id'],f'✅ Order <code>{oid}</code> confirmed.')
-    await c.message.edit_reply_markup(reply_markup=None); await c.answer('Confirmed')
+    await orders.update_one({'_id':oid},{'$set':{'status':'confirmed','otp_pending':True,'confirmed_by':c.from_user.id,'confirmed_at':datetime.now(timezone.utc)}})
+    await bot.send_message(o['user_id'],f"✅ <b>Order accepted</b>\n\nOrder ID: <code>{oid}</code>\nPlease wait. The owner will send the number OTP here after verification.")
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.message.reply('📨 <b>Send the number OTP</b> by replying to this buyer order message. The OTP will be delivered to the buyer.')
+    await c.answer('Confirmed — waiting for OTP')
 
 @router.callback_query(F.data.startswith('ord_ref:'))
 async def ord_ref(c:CallbackQuery):
@@ -571,6 +635,8 @@ async def ord_ref(c:CallbackQuery):
     if not o or o['status']!='pending_admin': return await c.answer('Already processed.',show_alert=True)
     await orders.update_one({'_id':oid},{'$set':{'status':'refunded','refunded_by':c.from_user.id,'refunded_at':datetime.now(timezone.utc)}})
     await users.update_one({'_id':o['user_id']},{'$inc':{'balance':o['amount']}})
+    # Put the refunded account back into active stock.
+    await products.update_one({'_id':o['product_id']},{'$set':{'active':True},'$unset':{'removed_at':''}},upsert=True)
     await bot.send_message(o['user_id'],f'↩️ Order <code>{oid}</code> refunded to your wallet.')
     await c.message.edit_reply_markup(reply_markup=None); await c.answer('Refunded')
 
@@ -598,7 +664,8 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command='start',description='𝐒ᴛᴀʀᴛ / 𝐕ᴇʀɪғʏ & 𝐌ᴀɪɴ 𝐌ᴇɴᴜ'),
         BotCommand(command='buy',description='𝐁ᴜʏ 𝐏ʀᴏᴅᴜᴄᴛs'),
-        BotCommand(command='wallet',description='𝐖ᴀʟʟᴇᴛ & 𝐃ᴇᴘᴏsɪᴛ'),
+        BotCommand(command='wallet',description='𝐖ᴀʟʟᴇᴛ 𝐁ᴀʟᴀɴᴄᴇ'),
+        BotCommand(command='deposit',description='𝐃ᴇᴘᴏsɪᴛ 𝐅ᴜɴᴅs'),
         BotCommand(command='orders',description='𝐌ʏ 𝐎ʀᴅᴇʀs'),
         BotCommand(command='support',description='𝐒ᴜᴘᴘᴏʀᴛ (5 ᴍɪɴ)'),
         BotCommand(command='admin',description='𝐀ᴅᴍɪɴ 𝐏ᴀɴᴇʟ'),
