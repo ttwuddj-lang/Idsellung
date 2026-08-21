@@ -2,6 +2,7 @@ import asyncio, logging, os
 from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,7 +17,7 @@ FORCE_CHANNEL_URL='https://t.me/jp_network'
 START_PHOTO='https://cdn.phototourl.com/free/2026-08-20-0e143e7d-9bff-42fa-bb3c-d62a2f00de4c.png'
 if not BOT_TOKEN or not MONGO_URI or not ADMIN_IDS: raise RuntimeError('Set BOT_TOKEN, MONGO_URI and ADMIN_IDS')
 
-bot=Bot(BOT_TOKEN, parse_mode='HTML'); dp=Dispatcher(); router=Router(); dp.include_router(router)
+bot=Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML')); dp=Dispatcher(); router=Router(); dp.include_router(router)
 db=AsyncIOMotorClient(MONGO_URI)[MONGO_DB]
 users, deposits, products, orders, support, settings=(db[x] for x in ('users','deposits','products','orders','support','settings'))
 
