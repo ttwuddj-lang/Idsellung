@@ -449,35 +449,71 @@ async def admin_removefund(m:Message):
 
 @router.message(F.reply_to_message, F.text)
 async def admin_reply_otp(m:Message):
+    """Deliver the admin's reply to the buyer's confirmed order.
+
+    The admin may reply either to the original New Order message or to the
+    bot's separate OTP instruction message.  The latter contains the former
+    as reply_to_message, so we resolve both message IDs and also fall back to
+    the Order ID printed in the message.  This makes the flow survive bot
+    restarts and Telegram's nested-reply layout.
+    """
     if m.from_user.id not in ADMIN_IDS or not m.reply_to_message:
         return
-    replied=m.reply_to_message
-    # The owner normally replies to the bot's instruction message:
-    # "📨 Send the number OTP by replying to this buyer order message."
-    # That instruction itself is a reply to the original New Order message.
-    # Accept both reply styles: directly replying to New Order OR replying to
-    # the instruction message, without changing the rest of the order flow.
-    if not replied.from_user or replied.from_user.id != (await bot.get_me()).id:
+
+    replied = m.reply_to_message
+    me = await bot.get_me()
+    if not replied.from_user or replied.from_user.id != me.id:
         return
 
-    order_message_id = replied.message_id
-    if replied.reply_to_message and replied.reply_to_message.from_user and \
-            replied.reply_to_message.from_user.id == (await bot.get_me()).id:
-        # If this is the instruction message, its parent is the New Order.
-        order_message_id = replied.reply_to_message.message_id
+    candidate_ids = {replied.message_id}
+    parent = getattr(replied, 'reply_to_message', None)
+    if parent is not None:
+        candidate_ids.add(parent.message_id)
 
-    o=await orders.find_one({
-        'admin_message_ids': order_message_id,
+    # Resolve by either the original admin order message or the OTP prompt.
+    o = await orders.find_one({
+        '$or': [
+            {'admin_message_ids': {'$in': list(candidate_ids)}},
+            {'otp_prompt_message_ids': {'$in': list(candidate_ids)}}
+        ],
         'status': 'confirmed',
         'otp_pending': True
     })
+
+    # Final fallback: extract the Mongo ObjectId from the replied message.
     if not o:
-        return
-    otp=m.text.strip()
-    if not otp:
-        return await m.answer('Send the OTP as a reply to the buyer order message.')
-    await bot.send_message(o['user_id'],f"🔐 <b>Number OTP</b>\n\n<code>{_html.escape(otp)}</code>")
-    await orders.update_one({'_id':o['_id']},{'$set':{'otp_pending':False,'otp_sent_at':datetime.now(timezone.utc),'otp_sent_by':m.from_user.id}})
+        combined = ' '.join(x for x in [replied.text, replied.caption] if x)
+        match = re.search(r'Order\s*ID\s*:\s*</?code>?\s*([0-9a-fA-F]{24})', combined, re.I)
+        if match:
+            try:
+                o = await orders.find_one({
+                    '_id': ObjectId(match.group(1)),
+                    'status': 'confirmed',
+                    'otp_pending': True
+                })
+            except Exception:
+                o = None
+
+    if not o:
+        return await m.answer('❌ This reply is not linked to a pending confirmed order.')
+
+    value = m.text.strip()
+    if not value:
+        return await m.answer('❌ Send the OTP/code as your reply.')
+
+    # Keep exactly what the admin typed, including multi-line codes.
+    await bot.send_message(
+        o['user_id'],
+        f"📨 <b>Number OTP</b>\n\n<code>{_html.escape(value)}</code>"
+    )
+    await orders.update_one(
+        {'_id': o['_id']},
+        {'$set': {
+            'otp_pending': False,
+            'otp_sent_at': datetime.now(timezone.utc),
+            'otp_sent_by': m.from_user.id
+        }}
+    )
     await m.answer('✅ OTP sent to the buyer.')
 
 @router.message(F.text)
@@ -629,8 +665,20 @@ async def buy(c:CallbackQuery):
         except Exception:
             pass
     await orders.update_one({'_id':oid},{'$set':{'admin_message_ids':admin_message_ids}})
-    await update_menu_message(c,f"✅ <b>Order created</b>\n\nCountry: {p.get('country','Unknown')}\nNumber: <code>{p.get('number',p['name'])}</code>\nAmount: ₹{price:.2f}\nOrder ID: <code>{oid}</code>\n\nAdmin will confirm your order.",None)
-    await c.answer()
+
+    # IMPORTANT: do not edit/delete the product/photo message after purchase.
+    # Keep it visible and send the purchased details as a NEW text message so
+    # the number cannot disappear together with a photo caption.
+    await bot.send_message(
+        c.from_user.id,
+        f"✅ <b>Order created</b>\n\n"
+        f"🌍 Country: <b>{p.get('country','Unknown')}</b>\n"
+        f"📞 Number: <code>{p.get('number',p['name'])}</code>\n"
+        f"💰 Amount: ₹{price:.2f}\n"
+        f"🆔 Order ID: <code>{oid}</code>\n\n"
+        f"⏳ Admin will confirm your order."
+    )
+    await c.answer('Order created')
 
 @router.callback_query(F.data.startswith('ord_ok:'))
 async def ord_ok(c:CallbackQuery):
@@ -640,7 +688,11 @@ async def ord_ok(c:CallbackQuery):
     await orders.update_one({'_id':oid},{'$set':{'status':'confirmed','otp_pending':True,'confirmed_by':c.from_user.id,'confirmed_at':datetime.now(timezone.utc)}})
     await bot.send_message(o['user_id'],f"✅ <b>Order accepted</b>\n\nOrder ID: <code>{oid}</code>\nPlease wait. The owner will send the number OTP here after verification.")
     await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.reply('📨 <b>Send the number OTP</b> by replying to this buyer order message. The OTP will be delivered to the buyer.')
+    prompt = await c.message.reply('📨 <b>Send the number OTP</b> by replying to this message or the buyer order message. The OTP will be delivered to the buyer.')
+    await orders.update_one(
+        {'_id':oid},
+        {'$addToSet':{'otp_prompt_message_ids':prompt.message_id}}
+    )
     await c.answer('Confirmed — waiting for OTP')
 
 @router.callback_query(F.data.startswith('ord_ref:'))
